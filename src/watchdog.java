@@ -1,4 +1,5 @@
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -8,55 +9,194 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.OpenOption;
+import java.nio.file.StandardOpenOption;
 import java.text.DecimalFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Scanner;
+import java.util.TreeSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  *
  * @author Česnek Michal, UNIDATAZ s.r.o.
  */
-public class NTPUtil {
+public class watchdog {
+    
+    //Počet celkových minutových cyklů od spuštění programu
+    public static long allTime = 0;
     
     public static void main(String[] args) {
-        ScheduledExecutorService pool = Executors.newScheduledThreadPool ( 1 );
+        ScheduledExecutorService pool = Executors.newScheduledThreadPool(1);
         Runnable r = new Runnable() {
             Long ntp = null;
             long noTime = 0;
             @Override
             public void run() {
+                allTime++;
                 if(ntp==null){
                     ntp = getNTPDateTimeOffsetMilis();
+                    System.out.println("NTP time diff: "+ntp+"ms");
                     if(ntp!=null){
                         setSystemDateAndTime(ntp);
-                        System.out.println("NTP diff: "+ntp);
                         for (long mins = noTime; mins >= 0; mins--) {
                             writeTime(System.currentTimeMillis()-(mins*60_000));
                         }
                     } else {
                         noTime++;
+                        return;
                     }
                 } else {
                     writeTime(System.currentTimeMillis());
                 }
+                uploadTimes();
+                uploadRsync();
             }
         };
         try {
-            pool.scheduleAtFixedRate(r, 0L, 1L, TimeUnit.MINUTES);
+            pool.scheduleAtFixedRate(r, 0L, 60L, TimeUnit.SECONDS);
+            if(isWindows()){
+                System.out.println("[PRESS ENTER TO EXIT]");
+                Scanner sc = new Scanner(System.in);
+                String userOption = sc.nextLine();
+                pool.shutdown();
+            }
             while (!pool.awaitTermination(1L, TimeUnit.SECONDS)) {
                 sleep(1000);
             }
         } catch (Exception ex) {
             ex.printStackTrace();
         }
+        System.exit(0);
     }
     
-    private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+    private static boolean uploadRsync(){
+        File f1 = new File("/var/log/rsync.log");
+        if(f1.exists()){
+            //tail -n 20 /var/log/rsync.log > /opt/rsync.log
+            String lines = CMD.call("tail","-n","20","/var/log/rsync.log");
+            if(lines==null) return false;
+            File f2 = new File("/opt/rsync.log");
+            f2.delete();
+            addLineToFile(f2, lines);
+            int res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/rsync.log","smb://dd-wrt/usb/");
+            return res==0;
+        } else {
+            System.err.println("File "+f1+" not exist!");
+            return false;
+        }
+    }
+    
+    private static boolean uploadTimes(){
+        //Spustíme reanalýzu intervalů
+        reanalyseIntervals();
+        //Pokusíme se stáhnout vzdálený soubor
+        int res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","-o","/opt/watchdog-remote.log","smb://dd-wrt/usb/watchdog.log");
+        //Podaří-li se stáhnout vzdálený soubor
+        if(res==0){
+            //odstraníme jej a pokračujeme v uploadu
+            new File("/opt/watchdog-remote.log").delete();
+        } else 
+        //Pokud byl vzdálený sobor odstraněn resp. neexistuje
+        if(res==78){
+            //Lokálně jej promažeme
+            logFile.delete();
+            //Vložíme zpět všechny časy od spuštění programu
+            for (long mins = allTime; mins >= 0; mins--) {
+                writeTime(System.currentTimeMillis()-(mins*60_000));
+            }
+            //Vynulujeme počítadlo allTime
+            allTime = 0;
+            //Spustíme reanalýzu intervalů
+            reanalyseIntervals();
+        } 
+        //Pokud stažení souboru nešlo udělat, nemá smysl dál něco uploadovat
+        else {
+            return false;
+        }
+        
+        //Upload log souborů
+        //watchdog.log
+        res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/watchdog.log","smb://dd-wrt/usb/");
+        if(res!=0) return false;
+        
+        //watchdog2.log
+        res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/watchdog2.log","smb://dd-wrt/usb/");
+        if(res!=0) return false;
+        
+        return true;
+    }
+    
+    public static void reanalyseIntervals() {
+        try {
+            File fileIn = logFile;
+            List<String> lines = Files.readAllLines(fileIn.toPath());
+            TreeSet<Long> ts = new TreeSet<>();
+            for (String line : lines) {
+                Date date = parse(line);
+                if (date == null) {
+                    continue;
+                }
+                long mins = date.getTime() / 60000L;
+                ts.add(Long.valueOf(mins));
+            }
+            ArrayList<LongIntervalAnalysisUtil.Interval> intervals = LongIntervalAnalysisUtil.getIntervals((Long[]) ts.toArray((Object[]) new Long[0]));
+            SimpleDateFormat f = sdf;
+            File fileOut = log2File;
+            fileOut.delete();
+            fileOut.createNewFile();
+            for (LongIntervalAnalysisUtil.Interval i : intervals) {
+                if (i.getRight() - i.getLeft() < 5L) {
+                    continue;
+                }
+                Long from = Long.valueOf(i.getLeft());
+                Long to = Long.valueOf(i.getRight());
+                Date left = new Date(from.longValue() * 60000L);
+                Date right = new Date(to.longValue() * 60000L);
+                String out = f.format(left) + " <-> " + f.format(right);
+                addLineToFile(fileOut,out);
+                System.out.println(out);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    
+    public static Date parse(String text) {
+        try {
+            return sdf.parse(text.trim());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+    
+    private static final SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yyyy HH:mm");
+    private static final File logFile = new File("/opt/watchdog.log");
+    private static final File log2File = new File("/opt/watchdog2.log");
+    
     private static final void writeTime(long currentTimeMilis){
-        System.out.println(sdf.format(new Date(currentTimeMilis)));
+        String dateTimeString = sdf.format(new Date(currentTimeMilis));
+        addLineToFile(logFile, dateTimeString);
+        System.out.println(dateTimeString);
+    }
+    
+    public static void addLineToFile(File f, String line) {
+        try {
+            Files.write(f.toPath(), (line+"\r\n").getBytes(), new OpenOption[]{StandardOpenOption.CREATE,StandardOpenOption.APPEND});
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
     
     private static final void setSystemDateAndTime(Long dateTimeOffsetMilis){
@@ -79,9 +219,9 @@ public class NTPUtil {
             }
         } else 
         if(isLinux()) {//ON LINUX
-            SimpleDateFormat dateTimeFormatter = new SimpleDateFormat("MMddhhmm[[yy]yy]");
+            SimpleDateFormat dateTimeFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
             Date dateTime = new Date(System.currentTimeMillis()+dateTimeOffsetMilis);
-            String[] cmds = new String[]{"cmd","/C","date",dateTimeFormatter.format(dateTime)};
+            String[] cmds = new String[]{"date","-s",dateTimeFormatter.format(dateTime)};
             String output = CMD.call(cmds);
 //            System.out.println(Arrays.stream(cmds).collect(Collectors.joining(" ")));
 //            System.out.println(output);
@@ -94,6 +234,7 @@ public class NTPUtil {
     private static NtpMessage getNtpMessage() {
         InetAddress address = null;
         try(DatagramSocket socket = new DatagramSocket()){
+            socket.setSoTimeout(5000);
             address = InetAddress.getByName(SERVER);
             final byte[] buffer = new NtpMessage().toByteArray();
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, PORT);
@@ -118,6 +259,124 @@ public class NTPUtil {
         return Math.round((msg.transmitTimestamp-msg.originateTimestamp)*1000d);
     }
     
+    //<editor-fold defaultstate="collapsed" desc="class LongIntervalAnalysisUtil">
+    public static class LongIntervalAnalysisUtil {
+        
+        public boolean addValue(Long value) {
+            return this.longSet.add(value);
+        }
+        
+        public boolean addValues(ArrayList<Long> values) {
+            return this.longSet.addAll(values);
+        }
+        
+        public boolean addValues(Long[] values) {
+            return this.longSet.addAll(Arrays.asList(values));
+        }
+        
+        public String getFormatedIntervals() {
+            return format(getIntervals());
+        }
+        
+        public ArrayList<Interval> getIntervals() {
+            ArrayList<Interval> intervals = new ArrayList<>();
+            ArrayList<Long> integerList = new ArrayList<>(this.longSet);
+            Collections.sort(integerList);
+            Long left = null;
+            Long right = null;
+            for (Long integer : integerList) {
+                if (left == null) {
+                    left = integer;
+                    right = integer;
+                    continue;
+                }
+                if (right.longValue() == integer.longValue() - 1L) {
+                    right = integer;
+                    continue;
+                }
+                intervals.add(new Interval(left.longValue(), right.longValue()));
+                left = integer;
+                right = integer;
+            }
+            
+            if (left != null && right != null) {
+                intervals.add(new Interval(left.longValue(), right.longValue()));
+            }
+            return intervals;
+        }
+        
+        private HashSet<Long> longSet = new HashSet<>();
+        
+        public static class Interval {
+            
+            private long left;
+            private long right;
+            
+            public Interval(long left, long right) {
+                assert left <= right;
+                this.left = left;
+                this.right = right;
+            }
+            
+            public long getLeft() {
+                return this.left;
+            }
+            
+            public long getRight() {
+                return this.right;
+            }
+            
+            public String toString() {
+                return "[" + this.left + ", " + this.right + "]";
+            }
+        }
+        
+        public static String format(ArrayList<Interval> intervals) {
+            if (intervals == null) {
+                return null;
+            }
+            if (intervals.isEmpty()) {
+                return "";
+            }
+            return intervals.stream()
+                    .map(i -> (i.getLeft() == i.getRight()) ? (i.getLeft() + "") : (i.getLeft() + "-" + i.getRight()))
+                    .collect(Collectors.joining(", "));
+        }
+        
+        public static ArrayList<Interval> getIntervals(Long[] values) {
+            LongIntervalAnalysisUtil iiau = new LongIntervalAnalysisUtil();
+            iiau.addValues(values);
+            return iiau.getIntervals();
+        }
+    }
+    //</editor-fold>
+    
+    //<editor-fold defaultstate="collapsed" desc="class Interval">
+    public static class Interval {
+        
+        private long left;
+        private long right;
+        
+        public Interval(long left, long right) {
+            assert left <= right;
+            this.left = left;
+            this.right = right;
+        }
+        
+        public long getLeft() {
+            return this.left;
+        }
+        
+        public long getRight() {
+            return this.right;
+        }
+        
+        public String toString() {
+            return "[" + this.left + ", " + this.right + "]";
+        }
+    }
+    //</editor-fold>
+    
     //<editor-fold defaultstate="collapsed" desc="class CMD">
     public static class CMD{
 //        public static void main(String[] args) throws IOException {
@@ -128,13 +387,36 @@ public class NTPUtil {
         public static String call(String... cmds) {
             try {
                 Process p = Runtime.getRuntime().exec(cmds);
+                if(!p.waitFor(1, TimeUnit.MINUTES)) {
+                    //timeout - kill the process. 
+                    p.destroy(); // consider using destroyForcibly instead
+                }
                 String sout = IS.toString(p.getInputStream());
                 String serr = IS.toString(p.getErrorStream());
                 if(serr!=null && !serr.isEmpty()) System.err.println(serr);
                 return sout+serr;
-            } catch (IOException ex) {
+            } catch (IOException | InterruptedException ex) {
                 ex.printStackTrace();
                 return null;
+            }
+        }
+        public static int callRV(String... cmds) {
+            try {
+                Process p = Runtime.getRuntime().exec(cmds);
+                if(!p.waitFor(1, TimeUnit.MINUTES)) {
+                    //timeout - kill the process. 
+                    p.destroy(); // consider using destroyForcibly instead
+                }
+                String sout = IS.toString(p.getInputStream());
+                String serr = IS.toString(p.getErrorStream());
+                int res = p.exitValue();
+                if(res!=0) System.out.println(sout+serr);
+                return res;
+            } catch (IOException ex) {
+                ex.printStackTrace();
+                return -1;
+            } catch (InterruptedException ex) {
+                return -2;
             }
         }
     }
