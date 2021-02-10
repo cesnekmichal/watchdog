@@ -3,6 +3,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PrintStream;
 import java.io.Reader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -14,24 +15,39 @@ import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
 import java.text.DecimalFormat;
 import java.text.SimpleDateFormat;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Scanner;
 import java.util.TreeSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 
 /**
  *
  * @author Česnek Michal, UNIDATAZ s.r.o.
  */
 public class watchdog {
+    
+    public static class Test{
+        public static void main(String[] args) {
+            reanalyseIntervals(new File("./watchdog.log"));
+        }
+    }
     
     //Počet celkových minutových cyklů od spuštění programu
     public static long allTime = 0;
@@ -99,7 +115,7 @@ public class watchdog {
     
     private static boolean uploadTimes(){
         //Spustíme reanalýzu intervalů
-        reanalyseIntervals();
+        reanalyseIntervals(null);
         //Pokusíme se stáhnout vzdálený soubor
         int res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","-o","/opt/watchdog-remote.log","smb://dd-wrt/usb/watchdog.log");
         //Podaří-li se stáhnout vzdálený soubor
@@ -118,14 +134,14 @@ public class watchdog {
             //Vynulujeme počítadlo allTime
             allTime = 0;
             //Spustíme reanalýzu intervalů
-            reanalyseIntervals();
+            reanalyseIntervals(null);
         } 
         //Pokud stažení souboru nešlo udělat, nemá smysl dál něco uploadovat
         else {
             return false;
         }
         
-        //Upload log souborů
+        //Upload log souborĹŻ
         //watchdog.log
         res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/watchdog.log","smb://dd-wrt/usb/");
         if(res!=0) return false;
@@ -137,9 +153,9 @@ public class watchdog {
         return true;
     }
     
-    public static void reanalyseIntervals() {
+    public static void reanalyseIntervals(File logFile) {
         try {
-            File fileIn = logFile;
+            File fileIn = logFile!=null ? logFile : watchdog.logFile;
             List<String> lines = Files.readAllLines(fileIn.toPath());
             TreeSet<Long> ts = new TreeSet<>();
             for (String line : lines) {
@@ -150,23 +166,58 @@ public class watchdog {
                 long mins = date.getTime() / 60000L;
                 ts.add(Long.valueOf(mins));
             }
-            ArrayList<LongIntervalAnalysisUtil.Interval> intervals = LongIntervalAnalysisUtil.getIntervals((Long[]) ts.toArray((Object[]) new Long[0]));
+            ;
+            ArrayList<LongIntervalAnalysisUtil.Interval> intervals = LongIntervalAnalysisUtil.getIntervals(ts.toArray(Long[]::new));
             SimpleDateFormat f = sdf;
-            File fileOut = log2File;
+            File fileOut = logFile!=null ? new File(logFile.getParentFile(),log2File.getName()) : log2File;
             fileOut.delete();
             fileOut.createNewFile();
+            //Kratší intervaly než 5 minut odstraníme
+            intervals.removeIf((i)->i.getRight() - i.getLeft() < 5L);
+            //Vyexportujeme intervaly
             for (LongIntervalAnalysisUtil.Interval i : intervals) {
-                if (i.getRight() - i.getLeft() < 5L) {
-                    continue;
-                }
-                Long from = Long.valueOf(i.getLeft());
-                Long to = Long.valueOf(i.getRight());
-                Date left = new Date(from.longValue() * 60000L);
-                Date right = new Date(to.longValue() * 60000L);
-                String out = f.format(left) + " <-> " + f.format(right);
+                Date from = new Date(i.getLeft()  * 60000L);
+                Date to   = new Date(i.getRight() * 60000L);
+                String out = f.format(from) + " <-> " + f.format(to);
                 addLineToFile(fileOut,out);
                 System.out.println(out);
             }
+            //Vyexportujeme po-pa, so-ne
+            Function<Long, String> l = (Long t) -> (t<=9 ? "0"+t : ""+t);
+            BiConsumer<Boolean,TreeSet<Long>> export = (Boolean poPa,TreeSet<Long> s) -> {
+                if(s==null || s.isEmpty()) return;
+                ArrayList<LongIntervalAnalysisUtil.Interval> its = LongIntervalAnalysisUtil.getIntervals(s.toArray(Long[]::new));
+                String out = poPa==null ? "N / A:" : (poPa ? "Po-Pa:" : "So-Ne:");
+                for (LongIntervalAnalysisUtil.Interval i : its) {
+                    out += l.apply(i.left/60)+":"+l.apply(i.left%60) +"-"+ l.apply(i.right/60)+":"+l.apply(i.right%60);
+                    if(i!=its.get(its.size()-1)) out += ", ";
+                }
+                addLineToFile(fileOut,out);
+                if(poPa!=null){
+                    System.out.println(out);
+                } else {
+                    System.err.println(out);
+                }
+            };
+            Boolean poPaPre = null;
+            ts.clear();
+            for (LongIntervalAnalysisUtil.Interval i : intervals) {
+                Date from = new Date(i.getLeft()  * 60000L);
+                Date to   = new Date(i.getRight() * 60000L);
+                i = new LongIntervalAnalysisUtil.Interval(DateUtil.getMinutesFromMidnight(from), DateUtil.getMinutesFromMidnight(to));
+                Boolean poPa = DateUtil.isPoPa(from, to) ? Boolean.TRUE  : 
+                            (DateUtil.isSoNeSv(from, to) ? Boolean.FALSE : (Boolean)null );
+                if(poPa!=poPaPre) {
+                    export.accept(poPaPre,ts);
+                    ts.clear();
+                    ts.addAll(i.valuesList());
+                    poPaPre = poPa;
+                } else {
+                    ts.addAll(i.valuesList());
+                }
+            }
+            export.accept(poPaPre,ts);
+            
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -176,7 +227,7 @@ public class watchdog {
         try {
             return sdf.parse(text.trim());
         } catch (Exception e) {
-            e.printStackTrace();
+            //e.printStackTrace();
             return null;
         }
     }
@@ -259,6 +310,118 @@ public class watchdog {
         return Math.round((msg.transmitTimestamp-msg.originateTimestamp)*1000d);
     }
     
+    //<editor-fold defaultstate="collapsed" desc="class DateUtil">
+    public static class DateUtil{
+        /** Spočítá a vrátí počet minut uběhlých od půnoci zadaného dne. */
+        public static long getMinutesFromMidnight(Date date){
+            Calendar c = toC(date);
+            return c.get(Calendar.HOUR_OF_DAY)*60+c.get(Calendar.MINUTE);
+        }
+        public static boolean isPoPa(Date from,Date to){
+            return isWeekday(from) && !isHollyday(from) && isWeekday(to) && !isHollyday(to);
+        }
+        public static boolean isSoNeSv(Date from,Date to){
+            return (isWeekend(from) || isHollyday(from)) && (isWeekend(to) || isHollyday(to));
+        }
+        /** Je zadané datum sobotou či nedělí? */
+        public static boolean isWeekend(Date date){
+            return equalAny(toLD(date).getDayOfWeek(), DayOfWeek.SATURDAY, DayOfWeek.SUNDAY);
+        }
+        /** Je zadané datum od pondělí do neděle? */
+        public static boolean isWeekday(Date date){
+            return equalAny(toLD(date).getDayOfWeek(), DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY, DayOfWeek.FRIDAY);
+        }
+        /** Je zadané datum známým datem nějakého svátku? */
+        public static boolean isHollyday(Date date){
+            LocalDate c = toLD(date);
+            for (Integer[] hollyday : hollydays) {
+                if(hollyday==null) continue;
+                int idx = 0;
+                if(hollyday.length>idx && hollyday[idx]!=null){
+                    if(c.getDayOfMonth()==hollyday[idx]){
+                        idx++;
+                        if(hollyday.length>idx && hollyday[idx]!=null){
+                            if(c.getMonthValue()==hollyday[idx]){
+                                idx++;
+                                if(hollyday.length>idx && hollyday[idx]!=null){
+                                    if(c.getYear()==hollyday[idx]){
+                                        //Kriterium je den, měsíc, rok a ty sedí
+                                        return true;
+                                    }
+                                } else {
+                                    //Kriterium je den, měsíc a ty sedí
+                                    return true;
+                                }
+                            }
+                        } else {
+                            //Kriterium je pouze den a ten sedí
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        private static final Integer[][] hollydays = arr(
+            dmy(1,1),//Nový rok
+            dmy(1,5),//Svátek práce
+            dmy(8,5),//Den vítězství
+            dmy(5,7),//Den slovanských věrozvěstů Cyrila a Metoděje
+            dmy(6,7),//Den upálené mistra Jana Husa
+            dmy(28,9),//Den české státnosti
+            dmy(28,10),//Den vzniku Československa
+            dmy(17,11),//Den boje za svobodu a demokracii 
+            dmy(24,12),//Štědrý den
+            dmy(25,12),//1. svátek vánoční
+            dmy(26,12),//2. svátek vánoční
+            dmy(2,4,2021),//Velký pátek
+            dmy(5,4,2021),//Velikonoční pondělí
+            dmy(15,4,2022),//Velký pátek
+            dmy(18,4,2022),//Velikonoční pondělí
+            dmy(07,4,2023),//Velký pátek
+            dmy(10,4,2023),//Velikonoční pondělí
+            dmy(29,3,2024),//Velký pátek
+            dmy(01,4,2024),//Velikonoční pondělí
+            dmy(18,4,2025),//Velký pátek
+            dmy(21,4,2025),//Velikonoční pondělí
+            dmy(03,4,2026),//Velký pátek
+            dmy(06,4,2026),//Velikonoční pondělí
+            dmy(26,3,2027),//Velký pátek
+            dmy(29,3,2027),//Velikonoční pondělí
+            dmy(14,4,2028),//Velký pátek
+            dmy(17,4,2028),//Velikonoční pondělí
+            dmy(30,3,2029),//Velký pátek
+            dmy(02,4,2029),//Velikonoční pondělí
+            dmy(19,4,2030),//Velký pátek
+            dmy(22,4,2030),//Velikonoční pondělí
+            null
+        );
+        public static Integer[] dmy(Integer... dayMonthYear){
+            return dayMonthYear;
+        }
+        public static Calendar toC(Date date){
+            Calendar c = Calendar.getInstance();
+            c.setTime(date);
+            return c;
+        }
+        public static LocalDate toLD(Date date){
+            return date.toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
+        }
+        public static Integer[][] arr(Integer[]... hollydays){
+            return hollydays;
+        }
+        public static <T> boolean equal(T a,T b){
+            return Objects.equals(a, b);
+        }
+        public static <T> boolean equalAny(T a,T... b){
+            for (T c : b) {
+                if(Objects.equals(a, c)) return true;
+            }
+            return false;
+        }
+    }
+    //</editor-fold>
+    
     //<editor-fold defaultstate="collapsed" desc="class LongIntervalAnalysisUtil">
     public static class LongIntervalAnalysisUtil {
         
@@ -276,6 +439,12 @@ public class watchdog {
         
         public String getFormatedIntervals() {
             return format(getIntervals());
+        }
+        
+        public static Interval join(Interval a, Interval b){
+            if(a==null) return b;
+            if(b==null) return a;
+            return new Interval(Math.min(a.left, b.left), Math.max(a.right, b.right));
         }
         
         public ArrayList<Interval> getIntervals() {
@@ -324,6 +493,10 @@ public class watchdog {
             
             public long getRight() {
                 return this.right;
+            }
+            
+            public List<Long> valuesList(){
+                return LongStream.rangeClosed(left, right).boxed().collect(Collectors.toList());
             }
             
             public String toString() {
@@ -875,36 +1048,32 @@ public class watchdog {
         * Returns a string representation of a reference identifier according
         * to the rules set out in RFC 2030.
         */
-       public static String referenceIdentifierToString(byte[] ref, short stratum, byte version) {
-          // From the RFC 2030:
-          // In the case of NTP Version 3 or Version 4 stratum-0 (unspecified)
-          // or stratum-1 (primary) servers, this is a four-character ASCII
-          // string, left justified and zero padded to 32 bits.
-          if(stratum==0 || stratum==1) {
-             return new String(ref);
-          }
-
-          // In NTP Version 3 secondary servers, this is the 32-bit IPv4
-          // address of the reference source.
-          else if(version==3) {
-                return unsignedByteToShort(ref[0]) + "." +
-                   unsignedByteToShort(ref[1]) + "." +
-                   unsignedByteToShort(ref[2]) + "." +
-                   unsignedByteToShort(ref[3]);
-             }
-
-          // In NTP Version 4 secondary servers, this is the low order 32 bits
-          // of the latest transmit timestamp of the reference source.
-          else if(version==4) {
-                return "" + ((unsignedByteToShort(ref[0]) / 256.0) + 
-                   (unsignedByteToShort(ref[1]) / 65536.0) +
-                   (unsignedByteToShort(ref[2]) / 16777216.0) +
-                   (unsignedByteToShort(ref[3]) / 4294967296.0));
-          }
-
-          return "";
-       }
-   }    
+        public static String referenceIdentifierToString(byte[] ref, short stratum, byte version) {
+            // From the RFC 2030:
+            // In the case of NTP Version 3 or Version 4 stratum-0 (unspecified)
+            // or stratum-1 (primary) servers, this is a four-character ASCII
+            // string, left justified and zero padded to 32 bits.
+            if (stratum == 0 || stratum == 1) {
+                return new String(ref);
+            } // In NTP Version 3 secondary servers, this is the 32-bit IPv4
+            // address of the reference source.
+            else if (version == 3) {
+                return unsignedByteToShort(ref[0]) + "."
+                        + unsignedByteToShort(ref[1]) + "."
+                        + unsignedByteToShort(ref[2]) + "."
+                        + unsignedByteToShort(ref[3]);
+            } // In NTP Version 4 secondary servers, this is the low order 32 bits
+            // of the latest transmit timestamp of the reference source.
+            else if (version == 4) {
+                return "" + ((unsignedByteToShort(ref[0]) / 256.0)
+                        + (unsignedByteToShort(ref[1]) / 65536.0)
+                        + (unsignedByteToShort(ref[2]) / 16777216.0)
+                        + (unsignedByteToShort(ref[3]) / 4294967296.0));
+            }
+            return "";
+        }
+        
+   }
     //</editor-fold>
     
     //<editor-fold defaultstate="collapsed" desc="System">
