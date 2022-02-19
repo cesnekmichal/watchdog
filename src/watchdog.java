@@ -3,7 +3,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.PrintStream;
 import java.io.Reader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -32,7 +31,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
@@ -105,7 +103,7 @@ public class watchdog {
             File f2 = new File("/opt/rsync.log");
             f2.delete();
             addLineToFile(f2, lines);
-            int res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/rsync.log","smb://dd-wrt/usb/");
+            int res = CMD.callRV("smbmap","-H","data.local","-u","data","-p","data","--upload","/opt/rsync.log","data/.watchdog/rsync.log");
             return res==0;
         } else {
             System.err.println("File "+f1+" not exist!");
@@ -117,14 +115,15 @@ public class watchdog {
         //Spustíme reanalýzu intervalů
         reanalyseIntervals(null);
         //Pokusíme se stáhnout vzdálený soubor
-        int res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","-o","/opt/watchdog-remote.log","smb://dd-wrt/usb/watchdog.log");
+                           // smbget   -U=data%data   -o=/opt/watchdog-remote.log   smb://data.local/data/.watchdog/watchdog.log
+        int res = CMD.callRV("smbget","-U=data%data","-o=/opt/watchdog-remote.log","smb://data.local/data/.watchdog/watchdog.log");
         //Podaří-li se stáhnout vzdálený soubor
         if(res==0){
             //odstraníme jej a pokračujeme v uploadu
             new File("/opt/watchdog-remote.log").delete();
         } else 
         //Pokud byl vzdálený sobor odstraněn resp. neexistuje
-        if(res==78){
+        if(res==1){
             //Lokálně jej promažeme
             logFile.delete();
             //Vložíme zpět všechny časy od spuštění programu
@@ -141,13 +140,13 @@ public class watchdog {
             return false;
         }
         
-        //Upload log souborĹŻ
+        //Upload log souborů
         //watchdog.log
-        res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/watchdog.log","smb://dd-wrt/usb/");
+        res = CMD.callRV("smbmap","-H","data.local","-u","data","-p","data","--upload","/opt/watchdog.log","data/.watchdog/watchdog.log");
         if(res!=0) return false;
         
         //watchdog2.log
-        res = CMD.callRV("curl","--user","dd-wrt:dd-wrt","--upload-file","/opt/watchdog2.log","smb://dd-wrt/usb/");
+        res = CMD.callRV("smbmap","-H","data.local","-u","data","-p","data","--upload","/opt/watchdog2.log","data/.watchdog/watchdog2.log");
         if(res!=0) return false;
         
         return true;
@@ -166,7 +165,7 @@ public class watchdog {
                 long mins = date.getTime() / 60000L;
                 ts.add(Long.valueOf(mins));
             }
-            ;
+            
             ArrayList<LongIntervalAnalysisUtil.Interval> intervals = LongIntervalAnalysisUtil.getIntervals(ts.toArray(Long[]::new));
             SimpleDateFormat f = sdf;
             File fileOut = logFile!=null ? new File(logFile.getParentFile(),log2File.getName()) : log2File;
@@ -233,7 +232,7 @@ public class watchdog {
     }
     
     private static final SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yyyy HH:mm");
-    private static final File logFile = new File("/opt/watchdog.log");
+    private static final File logFile  = new File("/opt/watchdog.log");
     private static final File log2File = new File("/opt/watchdog2.log");
     
     private static final void writeTime(long currentTimeMilis){
@@ -583,13 +582,17 @@ public class watchdog {
                 String sout = IS.toString(p.getInputStream());
                 String serr = IS.toString(p.getErrorStream());
                 int res = p.exitValue();
-                if(res!=0) System.out.println(sout+serr);
+                System.out.println("CMD> "+sout+serr+"\nexitValue="+res);
                 return res;
             } catch (IOException ex) {
                 ex.printStackTrace();
                 return -1;
             } catch (InterruptedException ex) {
+                ex.printStackTrace();
                 return -2;
+            } catch (Throwable ex) {
+                ex.printStackTrace();
+                return -3;
             }
         }
     }
