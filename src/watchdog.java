@@ -114,6 +114,11 @@ public class watchdog {
     private static boolean uploadTimes(){
         //Spustíme reanalýzu intervalů
         reanalyseIntervals(null);
+        //Pokud existuje soubor: /opt/watchdog-remote.log
+        if(new File("/opt/watchdog-remote.log").exists()){
+            //tak jej odstraníme
+            CMD.callRV("rm","/opt/watchdog-remote.log");
+        }
         //Pokusíme se stáhnout vzdálený soubor
                            // smbget   -U=data%data   -o=/opt/watchdog-remote.log   smb://data.local/data/.watchdog/watchdog.log
         int res = CMD.callRV("smbget","-U=data%data","-o=/opt/watchdog-remote.log","smb://data.local/data/.watchdog/watchdog.log");
